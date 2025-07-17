@@ -1,0 +1,61 @@
+name: Continuous Integration
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master     
+        with:
+          additional_files: 'run_on_uefi'
+
+  build:
+    name: Make
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ x86_64, i386, aarch64, riscv64, loongarch64 ]
+        image: [ alpine:latest ]
+
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+
+    - name: Load install script
+      id: run_on_uefi
+      uses: jaywcjlove/github-action-read-file@main
+      with:
+        path: run_on_uefi
+
+    - name: Run CI inside ${{ matrix.image }}
+      uses: uraimo/run-on-arch-action@v3
+      with:
+        arch: none
+        distro: none
+        shell: /bin/sh
+        base_image: |
+          --platform=linux/${{ matrix.arch }} ${{ matrix.arch == 'loongarch64' && 'loongarch64/alpine:3.21' || matrix.image }}
+        #githubToken: ${{ github.token }}
+        install: |
+          SOURCED=1 
+          NOCONFIRM=true
+          ${{ steps.run_on_uefi.outputs.content }}    
+          set -e
+          [ "$(uname -m)" = "x86_64" ] && [ "${{ matrix.arch }}" = "i386" ] && export ARCH=i386
+          run_on_uefi_install
+          apk add build-base gnu-efi-dev
+        run: |
+          set -e
+          make -C example clean
+          ARCH="${{ matrix.arch }}" make -C example all

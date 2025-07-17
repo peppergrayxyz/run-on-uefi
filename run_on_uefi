@@ -1,0 +1,776 @@
+#!/usr/bin/env sh
+
+###
+#
+#   Copyright (c) 2025 Pepper Gray <hello@peppergray.xyz>
+#   SPDX short identifier: Apache-2.0
+#
+#   run_on_uefi.sh - Execute efi-artifacts/commands on a target platform 
+#                    (x86_64, i386, arm, aarch64, riscv64, loongarch) via QEMU 
+#
+#   usage: ./run_on_uefi.sh install
+#          ./run_on_uefi.sh run <artifact> <work-dir> <qemu-args...>
+#
+###
+
+set -eu
+{ [ -n "${DEBUG:-}" ] || [ -n "${DEBUG_run_on_uefi:-}" ]; } && set -x
+
+
+###
+#
+#   arch - display uefi arch
+#
+#   usage: arch
+#
+#   CONF-VARS:
+#
+#   ARCH        architecture of qemu-system-* (e.g. x86_64, i386, aarch64), default: host architecture
+#
+###
+run_on_uefi_arch()
+{
+    arch="${ARCH:-"$(uname -m)"}"
+    
+    case "$arch" in
+        "x86_64")       echo "x64"  ;;
+        "i386"|"i686")  echo "ia32" ;;
+        "arm"*)         echo "arm"  ;;
+        "aarch64")      echo "aa64" ;;
+        *)              echo "$arch";;
+    esac
+}
+###
+
+###
+#
+#   run - run artifact on platform 
+#
+#   usage: run <artifact> <work-dir> <qemu-args...>
+#
+#   args:
+#   artifact    file name (prefix) to test, default: (prefix) artifact{UEFI_ARCH}.efi
+#   work-dir    directory that contains <artifact> and is used to create the test drive, default: ./build
+#   qemu-args   are forwarded to qemu
+#
+#   steps:
+#   1. Create a test drive
+#       drive
+#       ├── EFI
+#       │   └── BOOT
+#       |       └── boot{UEFI_ARCH}.efi (uefi-shell, optional)
+#       ├── <artifact>{UEFI_ARCH}.efi
+#       └── startup.nsh
+#   2. run it using qemu-system-$arch and log to <work-dir>/<artifact>-log
+#
+#   CONF-VARS:
+#
+#   ARCH        architecture of qemu-system-* (e.g. x86_64, i386, aarch64), default: host architecture
+#
+#   QEMU:
+#   PLATFORM    override platform passed to qemu
+#   OUT_FILE    redirect qemu output to file (unset for stdout), default: /dev/null
+#   MONSOCK     socket to connect to qemu monitor, default: <work-dir>/qemu-monitor-socket
+#   DURQ        timeout to quit qemu, unset to deactivate, default: 60s
+#   DURK        timeout to kill qemu, unset to deactivate, default: 70s
+#
+#   UEFI:
+#   UEFI_ARCH   architecture of firmware and and artifact (e.g. x64, ia32, aa64), default: host architecture
+#   FW_DIR      where to search for ovmf firmware, default: /usr/share/edk2
+#   FW_CODE     path to firmware code, default: FW_DIR/code.fd
+#   FW_VARS     path to firmware vars, default: FW_DIR/vars.fd
+#   UEFI_SHELL  path to uefi-shell,    default: FW_DIR/shell.efi
+#
+#   DRIVE:
+#   DRIVE_DIR   path to test drive, default: work-dir/drive
+#   RM_LOG      remove (previous) log,   default: false
+#   RM_DRIVE    remove (previous) drive, default: false
+#   RUN_SCRIPT  script to start,         default: unset (script creates startup.nsh)
+#   CP_ARTIFACT copy artifact to drive,  default: true
+#   CP_SHELL    copy uefi shell to test drive (don't rely on shell being present in firmware), default: true
+#
+###
+run_on_uefi_run()
+{
+    ## functions
+
+    setduration()
+    {
+        t_durk="$1"; t_durq="$2"; shift 2; 
+        ( "$@" ) & t_cmd_pid=$!
+        [ -n "$t_durq" ] && ( sleep "$t_durq" && kill -HUP $t_cmd_pid ) 2>/dev/null & t_watcher_quit=$!
+        [ -n "$t_durk" ] && ( sleep "$t_durk" && kill -9   $t_cmd_pid ) 2>/dev/null & t_watcher_kill=$!
+        wait $t_cmd_pid 2>/dev/null || return $?
+        [ -n "$t_durq" ] && { kill $t_watcher_quit || true; }
+        [ -n "$t_durk" ] && { kill $t_watcher_kill || true; }
+        return 0
+    }
+    read_d() {
+        r_d_var="$1"; eval "$r_d_var=";
+        while IFS= read -r r_d_line || [ -n "$r_d_line" ]; do
+            eval "$r_d_var=\${$r_d_var}\$r_d_line\$'\\n'"
+        done; eval "$r_d_var=\${$r_d_var%$'\\n'}"
+    }
+    print_check_result() 
+    {
+        dep_name="$1"; dep_path="$2"; dep_res="$3"; 
+        dep_res_txt="not found"; [ "$dep_res" -eq 0 ] && dep_res_txt="found";
+        echo " - $dep_name: $dep_res_txt ($dep_path)"
+        return "$dep_res"
+    }
+    check_cmd() 
+    {
+        dep_name="$1"; dep_cmd="$2"
+        dep_path="$(command -v "$dep_cmd")"; dep_res=$?
+        [ $dep_res -ne 0 ] && dep_path="$dep_cmd"
+        print_check_result "$dep_name" "$dep_path" "$dep_res"
+    }
+    check_file()
+    {
+        dep_name="$1"; dep_path="$2"
+        [ -f "$dep_path" ] && dep_res=0 || dep_res=1
+        print_check_result "$dep_name" "$dep_path" "$dep_res"
+    }
+    extract_tag()
+    {
+        t_tag="${1}"; t_data="$2"; t_t_var="${3:-}"; t_res=0;
+        t_tag_t="${t_tag%%" "*}"; t_var=${t_data#*"<$t_tag_t>"}    
+        [ "$t_var" = "$t_data" ] && { t_res=1; t_var="not found"; }
+        t_var="${t_var%"</$t_tag_t>"*}"; 
+        [ -z "$t_t_var" ] && { echo " - $t_tag : $t_var"; t_t_var="$t_tag_t"; }
+        eval "$t_t_var=\"$t_var\""
+        return $t_res
+    }
+
+    ## args
+
+    if [ $# -lt 1 ]; then
+        echo "usage: $0 run <artifact(prefix)> <work-dir> <qemu-args...>" >&2
+        return 2
+    fi
+
+    artifact="${1}"
+    work_dir="${2:-"./build"}"
+    [ $# -gt 2 ] && shift 2 && qemu_args="$*" || qemu_args=""
+
+    ## vars
+
+    # arch
+    arch="${ARCH:-"$(uname -m)"}"
+
+    # qemu
+    platform=""
+    uefi_arch=$(run_on_uefi_arch)
+
+    case "$arch" in
+        "x86_64") ;;
+        "i386"|\
+        "i686")                               arch="i386" ;;
+        "arm"*)     platform="-machine virt"; arch="arm"  ;;
+        "aarch64")  platform="-machine virt -cpu cortex-a57" ;;
+        *)          platform="-machine virt" ;;
+    esac
+    qemu_cmd="qemu-system-$arch"
+
+    platform="${PLATFORM:-$platform}"
+    [ -z ${OUT_FILE+x} ] && out_file="/dev/null" || out_file="$OUT_FILE"
+    qemu_monitor_socket="${MONSOCK:-"$work_dir/qemu-monitor-socket"}"
+
+    qemu_durq="${DURQ:-60s}"
+    qemu_durk="${DURK:-70s}"
+
+    # uefi
+    uefi_arch="${UEFI_ARCH:-"$uefi_arch"}"
+    ekd2_dir="${FW_DIR:-/usr/share/edk2}"
+
+    FW_CODE="${FW_CODE:-$ekd2_dir/$uefi_arch/code.fd}"
+    FW_VARS="${FW_VARS:-$ekd2_dir/$uefi_arch/vars.fd}"
+    uefi_shell="${UEFI_SHELL:-$ekd2_dir/$uefi_arch/shell.efi}"
+
+    # drive
+    drive_dir="${DRIVE_DIR:-"$work_dir/drive"}"
+    rm_log="${RML_OG:-false}"
+    rm_drive="${RM_DRIVE:-false}"
+    run_script="${RUN_SCRIPT:-}"
+    cp_script=$([ -n "$run_script" ] && echo "true" || echo "false")
+    cp_artifact="${CP_ARTIFACT:-true}"
+    cp_shell="${CP_SHELL:-true}"
+
+    # artifact
+    [ -f "$artifact" ] || artifact="$artifact$uefi_arch.efi" # (prefix)
+    run_artifact="$work_dir/$artifact"
+    run_log="$work_dir/$artifact.log"
+
+    ## check dependencies
+    echo "Run Artifact on Platform"
+    echo " - artifact    : $artifact"
+    echo " - work-dir    : $work_dir"
+    echo " - arch        : $arch"
+    [ -n "$qemu_args" ] && {
+    echo " - qemu args   : $qemu_args"
+    }
+
+    echo "Check dependencies:"
+                    check_cmd  "qemu        " "$qemu_cmd"     || return 1
+                    check_file "code        " "$FW_CODE"    || return 1
+                    check_file "vars        " "$FW_VARS"    || return 1
+    $cp_shell    && { check_file "shell       " "$uefi_shell"   || return 1; }
+    $cp_artifact && { check_file "artifact    " "$run_artifact" || return 1; }
+    $cp_script   && { check_file "run_script  " "$run_script"   || return 1; }
+
+    ## create env
+    echo "Create Environment:"
+
+    # delete previos log
+    $rm_log && rm -rf "$run_log"
+
+    # setup drive
+    echo " - drive-dir   : $drive_dir"
+    echo " - run script  : ${run_script:-"(create)"}"
+    ! $cp_shell && {
+    echo " - copy shell  : $cp_shell"; }
+    ! $cp_artifact && {
+    echo " - cp artifact : $cp_artifact"; }
+
+    echo "Creating drive:"
+    $rm_drive && rm -v -rf "$drive_dir"
+    boot_dir="$drive_dir/EFI/BOOT"
+    mkdir -v -p "$boot_dir"
+
+    # create startup script
+    if ! $cp_script; then
+        startup_nsh=""
+        read_d "startup_nsh" <<EOF
+@echo -off
+
+echo "<uefiver>%uefiversion%</uefiver>"
+echo "<shellver>%uefishellversion%</shellver>"
+echo "<ver>"
+ver
+echo "</ver>"
+echo "<cmd>"
+fs0:\\$artifact
+echo "</cmd><cres>%lasterror%</cres>"
+
+reset -s
+EOF
+        echo "$startup_nsh" > "$drive_dir/startup.nsh"
+    fi
+
+    # copy files
+    $cp_script   && cp -v "$run_script"   "$drive_dir/startup.nsh";
+    $cp_artifact && cp -v "$run_artifact" "$drive_dir/$artifact"
+    $cp_shell    && cp -v "$uefi_shell"  "$boot_dir/boot$uefi_arch.efi";
+
+    echo "Drive Content:"
+    tree "$drive_dir"
+
+    ## run qemu
+
+    read_d "qemu_cmd_str" << EOF
+$qemu_cmd $platform \\
+-drive if=pflash,format=raw,unit=0,file=$FW_CODE,readonly=on \\
+-drive if=pflash,format=raw,unit=1,file=$FW_VARS,snapshot=on \\
+-drive file=fat:rw:$drive_dir,format=raw,media=disk,if=virtio \\
+-chardev stdio,id=char0,logfile=$run_log,signal=off \\
+-serial chardev:char0 -display none \\
+-monitor unix:$qemu_monitor_socket,server,nowait \\
+-nodefaults -nographic
+EOF
+    [ -n "$qemu_args" ] && qemu_cmd_str="$qemu_cmd_str $(echo " \\"; echo " $qemu_args")"
+    [ -n "$out_file"  ] && qemu_cmd_str="$qemu_cmd_str $(echo " \\"; echo " > $out_file")"
+
+    echo "Run Command:"
+    echo "'$qemu_cmd_str'"
+
+    echo "Starting qemu:"
+    [ -n "$out_file" ] && 
+    echo " - output      : $out_file"
+    echo " - timeout     : quit: $qemu_durq, kill: $qemu_durk"
+    echo " - log         : 'tail -f $run_log'"
+    echo " - monitor     : 'socat -,echo=0,icanon=0 unix-connect:$qemu_monitor_socket'"
+
+    if setduration "$qemu_durk" "$qemu_durq" eval "eval \$(echo \"$qemu_cmd_str\")"; then
+        res=$?
+        echo "Run completed:"
+    else
+        res=$?
+        echo "Run interrupted:"
+        case "$res" in
+            124) echo "- exited qemu after timeout ($res)" >&2 ;;
+            137) echo "- killed qemu after timeout ($res)" >&2 ;;
+            *)   echo "- failed to start $qemu_cmd ($res)" >&2 ;;
+        esac
+    fi
+
+    ## process log
+
+    log_raw=""; log_new=""; has_run_log=false
+    [ -f "$run_log" ] && has_run_log=true
+    $has_run_log && read_d "log_raw" < "$run_log"
+
+    # add tags
+    read_d "log_new" << EOF
+<run>
+<log>$( $has_run_log && [ -n "$log_raw" ] && echo ""; $has_run_log && echo "$log_raw"; echo "</log>"; )
+<lres>$res</lres>
+</run>
+EOF
+    # write new log
+    echo "$log_new" > "$run_log"
+
+    # evaluate tags
+
+    logfile_txt=" - log         :"
+    f="$logfile_txt failed to"
+
+    ! $has_run_log    && { echo "$f start qemu"; return 1; }
+    [ -z "$log_raw" ] && { echo "$f boot";       return 1; }
+
+    extract_tag "uefiver    " "$log_raw" || return 1;
+    extract_tag "shellver   " "$log_raw" || return 1;
+    extract_tag "ver        " "$log_raw" "edk2ver" || edk2ver=""
+
+    if [ -n "$edk2ver" ]; then
+        edk2info="${edk2ver#*"UEFI v${uefiver:?}"}"
+        if [ "$edk2info" = "$edk2ver" ] ; then edk2info=""; else
+            edk2info="${edk2info#*"("}"
+            edk2info="${edk2info%")"*}"
+        fi
+    fi
+    [ -z "${edk2info:-}" ] && edk2info="not found"
+    echo " - edk2info    : $edk2info"
+
+    logcmd1="${log_raw#*"<cmd>"}";      [ "$logcmd1" = "$log_raw" ] && { echo "$f start script";  return 1; }
+    log_cmd="${logcmd1%"</cmd>"*}";     [ "$log_cmd" = "$logcmd1" ] && { echo "$f finish script"; return 1; }
+
+    echo "Artifact Output:"
+    echo "<<EOF${log_cmd}EOF"
+
+
+    return $res
+}; 
+###
+
+###
+#
+#   install edk2 - edk2 fallback
+#
+#   vars
+#   arch        architecture
+#   inst-dir    install directory
+#   temp-dir    tem directory 
+#   force       force install   
+#   targets     edk2, shell
+#
+###
+run_on_uefi_install_edk2()
+{
+
+    ## functions
+
+    WGET="wget -qO"
+
+    download_pkg()
+    {
+        download_dst="$1"
+        download_url="$2"
+        echo "- url    : $download_url"
+        if ! $WGET "$download_dst" "$download_url"; then
+        echo "download failed" >&2
+        return 1;
+        fi
+    }
+    create_link()
+    {
+        create_link_target="$1"
+        create_link_link="$2"
+        echo "$(dirname "$create_link_link")/$create_link_target"
+        if ! { [ -f "$create_link_target" ] || [ -f "$(dirname "$create_link_link")/$create_link_target" ]; }; then
+        echo "$create_link_target does not exist" >&2
+        return 1
+        fi
+        ln -vfs "$create_link_target" "$create_link_link"
+    }
+    getOvmfPkg()
+    {
+        pkg="$1"
+        pkg_dir="$2"
+
+        pkg_base_url="http://ftp.debian.org/debian/pool/main/e/edk2"
+        pkg_release="2025.02-8_all"
+        pkg_name="${pkg}_$pkg_release"
+        pkg_url="$pkg_base_url/$pkg_name.deb"
+        pkg_path="$pkg_dir/$pkg.deb"
+    
+
+        echo "- pkg    : $pkg"
+        echo "- release: $pkg_release"
+        echo "- pkg-url: $pkg_url"
+        echo "- file   : $pkg_path"
+    
+        if ! $WGET "$pkg_path" "$pkg_url"; then
+        echo "download failed $?" >&2
+        return 1;
+        fi
+    }
+    createOMVFLinks()
+    {
+        ovmflink_arch="$1"
+        ovmflink_dir="$2"
+
+        case "$ovmflink_arch" in
+            "x86_64")
+                ovmf_code="OVMF/OVMF_CODE_4M.fd"
+                ovmf_vars="OVMF/OVMF_VARS_4M.fd"
+            ;;
+            "i386"|\
+            "i686")
+                ovmf_code="OVMF/OVMF32_CODE_4M.fd"
+                ovmf_vars="OVMF/OVMF32_VARS_4M.fd"
+            ;;
+            "aarch64")
+                ovmf_code="AAVMF/AAVMF_CODE.fd"
+                ovmf_vars="AAVMF/AAVMF_VARS.fd"
+            ;;
+            "arm"*)
+                ovmf_code="AAVMF/AAVMF32_CODE.fd"
+                ovmf_vars="AAVMF/AAVMF32_VARS.fd"
+            ;;
+            "loongarch64")
+                ovmf_code="qemu-efi-loongarch64/QEMU_EFI.fd"
+                ovmf_vars="qemu-efi-loongarch64/QEMU_VARS.fd"
+            ;;
+            "riscv64")
+                ovmf_code="qemu-efi-riscv64/RISCV_VIRT_CODE.fd"
+                ovmf_vars="qemu-efi-riscv64/RISCV_VIRT_VARS.fd"
+            ;;
+            *) 
+                ovmf_code="qemu-efi-$ovmflink_arch/QEMU_EFI.fd"
+                ovmf_vars="qemu-efi-$ovmflink_arch/QEMU_VARS.fd"
+        esac
+
+        create_link "../../$ovmf_code" "$ovmflink_dir/code.fd" || return $?
+        create_link "../../$ovmf_vars" "$ovmflink_dir/vars.fd" || return $?
+    }
+    installOVMF()
+    {
+        ovmf_pkg_arch="$1"
+        ovmf_temp_dir="$2"
+        ovmf_inst_dir="$3"
+        ovmf_link_dir="$4"
+
+        case "$ovmf_pkg_arch" in        
+            "i386"|\
+            "i686")   ovmf_pkg="ovmf-ia32"                ;;
+            "x86_64") ovmf_pkg="ovmf"                     ;;
+            "arm"*)   ovmf_pkg="qemu-efi-arm"             ;;
+            *)        ovmf_pkg="qemu-efi-$ovmf_pkg_arch"  ;;
+        esac
+
+        echo "Download deb for $ovmf_pkg:"
+        ovmf_work_dir="$ovmf_temp_dir/$ovmf_pkg"
+        mkdir -p "$ovmf_work_dir"
+        getOvmfPkg "$ovmf_pkg" "$ovmf_work_dir" || return $?
+
+        echo "Install $ovmf_pkg:"
+        ar vx "$ovmf_work_dir/$ovmf_pkg.deb" --output="$ovmf_work_dir"       || return $?
+        tar -xvf "$ovmf_work_dir/data.tar.xz" --directory="$ovmf_inst_dir/"  || return $?
+        rm -rf "$ovmf_work_dir" 
+        
+        echo "Create links:"  
+        mkdir -p "$ovmf_link_dir"
+        createOMVFLinks "$ovmf_pkg_arch" "$ovmf_link_dir" || return $?
+    }
+    createUefiShellLinks()
+    {
+        uefi_shell_link_arch="$1"
+        uefi_shell_link_dir="$2"
+        create_link "shell$uefi_shell_link_arch.efi" "$uefi_shell_link_dir/shell.efi" || return 1
+    }
+    installUefiShell()
+    {
+        uefi_shell_arch="$1"
+        uefi_shell_inst_dir="$2"
+        
+        uefi_shell_release="25H1"
+        uefi_shell_pkg="shell$uefi_shell_arch.efi"
+
+        uefi_shell_source="https://github.com/pbatard/UEFI-Shell/releases/download/$uefi_shell_release"
+        uefi_shell_url="$uefi_shell_source/$uefi_shell_pkg"
+
+        echo "Download UEFI-Shell ($uefi_shell_pkg):"
+        download_pkg "$uefi_shell_inst_dir/$uefi_shell_pkg" "$uefi_shell_url" || return $?
+
+        echo "Create links:"  
+        createUefiShellLinks "$uefi_shell_arch" "$uefi_shell_inst_dir" || return $?
+    }
+
+    ## vars
+
+    tools_arch="$1"
+    tools_inst_dir="$2"
+    tools_temp_dir="$3"
+    tools_force="$4"
+    shift 4
+    tools_targets="$*"
+
+    tools_uefi_arch=$(run_on_uefi_arch)
+    tools_link_dir="$tools_inst_dir/usr/share/edk2/$tools_uefi_arch"
+
+    ## Install tools
+
+    for t in $tools_targets; do
+        case "$t" in
+        "edk2")     echo "Installing EDK2 Firmware"
+                    if ! createOMVFLinks "$tools_arch" "$tools_link_dir" || [ -n "$tools_force" ] ; then
+                        installOVMF "$tools_arch" "$tools_temp_dir" "$tools_inst_dir" "$tools_link_dir" || return $?
+                    fi
+        ;;
+        "shell")    echo "Installing UEFI-Shell"
+                    if ! createUefiShellLinks "$tools_uefi_arch" "$tools_link_dir" || [ -n "$tools_force" ]; then
+                        installUefiShell "$tools_uefi_arch" "$tools_link_dir" || return $?
+                    fi
+        ;;
+        *)  echo "unsupported target '$t'" >&2
+            exit 1
+        ;;
+        esac
+    done
+}
+###
+
+###
+#
+#   install - install dependencies
+
+#   CONF-VARS:
+#
+#   ARCH        architecture of qemu-system-* (e.g. x86_64, i386, aarch64), default: host architecture
+#
+#   INSTALLER   package manager, default: test availablity this order: apt, dnf, pacman, apk, emerge
+#   INST_DIR    install path, default: /
+#   TEMP_DIR    temp dir, default: /tmp
+#   EDK2_FORCE  force manual install, even if packages exist, default: false
+#   EDK2_FAIL   fail if package manager installation is not possible, default: false
+#   NO_SHELL    skip installing uefi-shell, default: false
+#   NOCONFIRM   don't ask for user consent, default: false
+#
+###
+run_on_uefi_install()
+{
+    ## functions
+
+    check_pkg() 
+    {
+        pkg_inst="$1"; pkg_label="$2"; pkg_name="$3";
+        echo "$pkg_inst: $?"
+        case "$pkg_inst" in
+            "apt")      apt-cache show "$pkg_name" > /dev/null 2>&1 ;;
+            "dnf")      dnf info -q    "$pkg_name" > /dev/null 2>&1 ;;
+            "pacman")   pacman -Si     "$pkg_name" > /dev/null 2>&1 ;;
+            "apk")      apk info       "$pkg_name" > /dev/null 2>&1 ;;
+            *)  echo "unknown installer '$pkg_inst"; 
+                return 1
+            ;;
+        esac && pkg_res="found" || pkg_res="not found"
+        echo " - $pkg_label : $pkg_name ($pkg_res)"
+        [ "$pkg_res" = "found" ]
+    }
+
+    user_consent()
+    {
+        printf "Continue? (y/n) "
+        read -r answer
+
+        case "$answer" in
+            [Yy]*)
+                return 0 
+            ;;
+            *) echo "aborted."
+                return 1 
+            ;;
+        esac
+    }
+    
+    ## vars
+
+    arch="${ARCH:-"$(uname -m)"}"
+    installer="${INSTALLER:-}"
+    inst_dir="${INST_DIR:-/}"
+    temp_dir="${TEMP_DIR:-/tmp}"
+    edk2_force="${EDK2_FORCE:-false}"
+    edk2_fail="${EDK2_FAIL:-false}"
+    no_shell="${NO_SHELL:-false}"
+    noconfirm="${NOCONFIRM:-false}"
+
+    ## package manager
+
+    echo "Install Run on Uefi dependencies"
+
+    if [ -z "$installer" ]; then
+        for cmd in apt dnf pacman apk emerge; do
+            command -v "$cmd" > /dev/null 2>&1 && installer="$cmd" && break;
+        done
+    fi
+
+    if [ -z "$installer" ]; then
+        echo "$0: no supported package manager found" >&2
+        exit 1
+    fi
+
+    case "$installer" in
+        "apt")    install_cmd="apt install -y" ;;
+        "dnf")    install_cmd="dnf -y install" ;;
+        "pacman") install_cmd="pacman -Sy --noconfirm" ;;
+        "apk")    install_cmd="apk add" ;;
+        *)
+            echo "$0: unsupported package manager ($installer)" >&2
+            exit 1
+        ;;
+    esac
+
+    echo " - installer   : $installer"
+
+    ## packages
+
+    # qemu
+    case "$installer" in
+        "pacman")       qemu_system="qemu-base" ;;
+        *)  case "$arch" in
+                "i386"|\
+                "i686") qemu_system="qemu-system-i386"  ;;
+                "arm"*) qemu_system="qemu-system-arm"   ;;
+                *)      qemu_system="qemu-system-$arch" ;;
+            esac
+        ;;
+    esac
+
+    # edk2
+    case "$arch" in
+        "x86_64") ekd2package="edk2-ovmf"      ;;
+        "i386"|\
+        "i686")   ekd2package="edk2-ovmf-ia32" ;;
+        "arm")    ekd2package="edk2-arm"       ;;
+        *)        ekd2package="edk2-$arch"     ;;
+    esac
+
+    echo "Update Packages:"
+    case "$installer" in
+        "apt")      apt update -y ;;
+        "dnf")      dnf -y update ;;
+        "pacman")   pacman -Sy    ;;
+        "apk")      apk update    ;;
+        *)          return 1      ;;
+    esac || return 1
+
+    echo "Check Packages:"
+    packages=""; edk2_failed=false
+    check_pkg "$installer" "qemu       " "$qemu_system" && packages="$packages $qemu_system" || return 1;
+    check_pkg "$installer" "firmware   " "$ekd2package" && packages="$packages $ekd2package" || edk2_failed=true;
+    $edk2_failed && $edk2_fail && return 1;
+
+    ## Install Packages
+
+    echo "Installing packages:"
+    pkg_install_cmd="$install_cmd$packages"
+    echo " - command     : $pkg_install_cmd"
+    $noconfirm || user_consent || return 1
+    eval "$pkg_install_cmd" || return 1
+
+    if  ( ! $edk2_failed ) && ( ! $edk2_force ) && $no_shell; then
+        return 0;
+    fi
+
+    ## EDK2 Fallback
+
+    echo "Installing tools:"
+    
+    # depdencies
+    tools=""; packages=" wget tar xz binutils"
+    ( $edk2_failed || $edk2_force ) && tools="$tools edk2"
+    ( ! $no_shell )                 && tools="$tools shell"
+
+    echo " - packages    : wget tar xz binutils"
+    echo " - tools       :$tools"
+
+    # install
+    pkg_install_cmd="$install_cmd$packages"
+    $noconfirm || user_consent || return 1
+    eval "$pkg_install_cmd" || return 1
+    run_on_uefi_install_edk2 "$arch" "$inst_dir" "$temp_dir" "$edk2_force" "$tools" || return 1
+
+    echo "done!" 
+}
+
+
+###
+#
+#   validate - check artifact output
+#
+#   usage: validate <artifact> <work-dir> < <reference>
+#
+#   args:
+#   artifact    file name (prefix) to test, default: (prefix) artifact{UEFI_ARCH}.efi
+#   work-dir    directory that contains <artifact> and is used to create the test drive, default: ./build
+#   reference   reference output to compare against
+#
+#   CONF-VARS:
+#
+#   ARCH        architecture of qemu-system-* (e.g. x86_64, i386, aarch64), default: host architecture
+#   UEFI_ARCH   architecture of firmware and and artifact (e.g. x64, ia32, aa64), default: host architecture
+#
+###
+run_on_uefi_validate()
+{
+    if [ $# -lt 1 ]; then
+        echo "usage: $0 validate <artifact(prefix)> <work-dir> < <reference>" >&2
+        return 2
+    fi
+
+    artifact="${1}"
+    work_dir="${2:-"./build"}"
+
+    arch="${ARCH:-"$(uname -m)"}"
+    uefi_arch=$(run_on_uefi_arch)
+    uefi_arch="${UEFI_ARCH:-"$uefi_arch"}"
+
+    run_log="$artifact.log"
+    [ -f "$run_log" ] || run_log="$artifact$uefi_arch.efi.log" # (prefix)
+    run_log="$work_dir/$run_log"
+
+    run_output="$(sed -n '/<cmd>/,/<\/cmd>/{/<cmd>/d;/<\/cmd>/q;p}' "$run_log")"
+    ref_output=$(cat)
+
+    if [ "$run_output" = "$ref_output" ]; then
+        echo "match!"
+        return 0
+    else
+        echo "different:"
+        echo "run output=<<EOF"
+        echo "$run_output" | tr -d '\r'
+        echo "EOF"
+        echo "ref output=<<EOF"
+        echo "$ref_output" | tr -d '\r'
+        echo "EOF"
+        return 1
+    fi
+}
+###
+
+######
+if [ -z "${SOURCED:-}" ]; then
+    command="${1:-}"
+    case "$command" in
+        "arch"|"install"|"run"|"validate")     
+            shift; eval "run_on_uefi_$command $*" 
+        ;;
+        *)  echo "usage: $0 <command>" >&2
+            echo "  arch      show uefi architecture" >&2
+            echo "  install   install dependencies" >&2
+            echo "  run       run artifact" >&2
+            echo "  validate  validate run log" >&2
+            exit 2; 
+        ;;
+    esac
+fi
