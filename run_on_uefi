@@ -77,9 +77,9 @@ run_on_uefi_arch()
 #   UEFI:
 #   UEFI_ARCH   architecture of firmware and and artifact (e.g. x64, ia32, aa64), default: host architecture
 #   FW_DIR      where to search for ovmf firmware, default: /usr/share/edk2
-#   FW_CODE     path to firmware code, default: FW_DIR/code.fd
-#   FW_VARS     path to firmware vars, default: FW_DIR/vars.fd
-#   UEFI_SHELL  path to uefi-shell,    default: FW_DIR/shell.efi
+#   FW_CODE     path to firmware code, default: debian default
+#   FW_VARS     path to firmware vars, default: debian default
+#   UEFI_SHELL  path to uefi-shell,    default: debian default
 #
 #   DRIVE:
 #   DRIVE_DIR   path to test drive, default: work-dir/drive
@@ -181,11 +181,43 @@ run_on_uefi_run()
 
     # uefi
     uefi_arch="${UEFI_ARCH:-"$uefi_arch"}"
-    ekd2_dir="${FW_DIR:-/usr/share/edk2}"
-
-    FW_CODE="${FW_CODE:-$ekd2_dir/$uefi_arch/code.fd}"
-    FW_VARS="${FW_VARS:-$ekd2_dir/$uefi_arch/vars.fd}"
-    uefi_shell="${UEFI_SHELL:-$ekd2_dir/$uefi_arch/shell.efi}"
+    case "$arch" in
+        "x86_64")
+            uefi_path="/usr/share/OVMF"
+            for suffix in "_4M.fd" ".4M.fd" ".fd"; do
+                uefi_code="$uefi_path/OVMF_CODE$suffix"
+                uefi_vars="$uefi_path/OVMF_VARS$suffix"
+                [ -f "$uefi_code" ] && break
+            done
+        ;;
+        "i386"|\
+        "i686")
+            uefi_code="/usr/share/OVMF/OVMF32_CODE_4M.fd"
+            uefi_vars="/usr/share/OVMF/OVMF32_VARS_4M.fd"
+        ;;
+        "aarch64")
+            uefi_code="/usr/share/AAVMF/AAVMF_CODE.fd"
+            uefi_vars="/usr/share/AAVMF/AAVMF_VARS.fd"
+        ;;
+        "arm"*)
+            uefi_code="/usr/share/AAVMF/AAVMF32_CODE.fd"
+            uefi_vars="/usr/share/AAVMF/AAVMF32_VARS.fd"
+        ;;
+        "loongarch64")
+            uefi_code="/usr/share/qemu-efi-loongarch64/QEMU_EFI.fd"
+            uefi_vars="/usr/share/qemu-efi-loongarch64/QEMU_VARS.fd"
+        ;;
+        "riscv64")
+            uefi_code="/usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd"
+            uefi_vars="/usr/share/qemu-efi-riscv64/RISCV_VIRT_VARS.fd"
+        ;;
+        *) 
+            uefi_code="qemu-efi-$arch/QEMU_EFI.fd"
+            uefi_vars="qemu-efi-$arch/QEMU_VARS.fd"
+    esac
+    uefi_code="${FW_CODE:-"$uefi_code"}"
+    uefi_vars="${FW_VARS:-"$uefi_vars"}"
+    uefi_shell="${UEFI_SHELL:-"/usr/share/efi-shell-$uefi_arch/shell$uefi_arch.efi"}"
 
     # drive
     drive_dir="${DRIVE_DIR:-"$work_dir/drive"}"
@@ -211,9 +243,9 @@ run_on_uefi_run()
     }
 
     echo "Check dependencies:"
-                    check_cmd  "qemu        " "$qemu_cmd"     || return 1
-                    check_file "code        " "$FW_CODE"    || return 1
-                    check_file "vars        " "$FW_VARS"    || return 1
+                      check_cmd  "qemu        " "$qemu_cmd"     || return 1
+                      check_file "code        " "$uefi_code"    || return 1
+                      check_file "vars        " "$uefi_vars"    || return 1
     $cp_shell    && { check_file "shell       " "$uefi_shell"   || return 1; }
     $cp_artifact && { check_file "artifact    " "$run_artifact" || return 1; }
     $cp_script   && { check_file "run_script  " "$run_script"   || return 1; }
@@ -269,8 +301,8 @@ EOF
 
     read_d "qemu_cmd_str" << EOF
 $qemu_cmd $platform \\
--drive if=pflash,format=raw,unit=0,file=$FW_CODE,readonly=on \\
--drive if=pflash,format=raw,unit=1,file=$FW_VARS,snapshot=on \\
+-drive if=pflash,format=raw,unit=0,file=$uefi_code,readonly=on \\
+-drive if=pflash,format=raw,unit=1,file=$uefi_vars,snapshot=on \\
 -drive file=fat:rw:$drive_dir,format=raw,media=disk,if=virtio \\
 -chardev stdio,id=char0,logfile=$run_log,signal=off \\
 -serial chardev:char0 -display none \\
@@ -354,207 +386,17 @@ EOF
 
 ###
 #
-#   install edk2 - edk2 fallback
-#
-#   vars
-#   arch        architecture
-#   inst-dir    install directory
-#   temp-dir    tem directory 
-#   force       force install   
-#   targets     edk2, shell
-#
-###
-run_on_uefi_install_edk2()
-{
-
-    ## functions
-
-    WGET="wget -qO"
-
-    download_pkg()
-    {
-        download_dst="$1"
-        download_url="$2"
-        echo "- url    : $download_url"
-        if ! $WGET "$download_dst" "$download_url"; then
-        echo "download failed" >&2
-        return 1;
-        fi
-    }
-    create_link()
-    {
-        create_link_target="$1"
-        create_link_link="$2"
-        echo "$(dirname "$create_link_link")/$create_link_target"
-        if ! { [ -f "$create_link_target" ] || [ -f "$(dirname "$create_link_link")/$create_link_target" ]; }; then
-        echo "$create_link_target does not exist" >&2
-        return 1
-        fi
-        ln -vfs "$create_link_target" "$create_link_link"
-    }
-    getOvmfPkg()
-    {
-        pkg="$1"
-        pkg_dir="$2"
-
-        pkg_base_url="http://ftp.debian.org/debian/pool/main/e/edk2"
-        pkg_release="2025.02-8_all"
-        pkg_name="${pkg}_$pkg_release"
-        pkg_url="$pkg_base_url/$pkg_name.deb"
-        pkg_path="$pkg_dir/$pkg.deb"
-    
-
-        echo "- pkg    : $pkg"
-        echo "- release: $pkg_release"
-        echo "- pkg-url: $pkg_url"
-        echo "- file   : $pkg_path"
-    
-        if ! $WGET "$pkg_path" "$pkg_url"; then
-        echo "download failed $?" >&2
-        return 1;
-        fi
-    }
-    createOMVFLinks()
-    {
-        ovmflink_arch="$1"
-        ovmflink_dir="$2"
-
-        case "$ovmflink_arch" in
-            "x86_64")
-                ovmf_code="OVMF/OVMF_CODE_4M.fd"
-                ovmf_vars="OVMF/OVMF_VARS_4M.fd"
-            ;;
-            "i386"|\
-            "i686")
-                ovmf_code="OVMF/OVMF32_CODE_4M.fd"
-                ovmf_vars="OVMF/OVMF32_VARS_4M.fd"
-            ;;
-            "aarch64")
-                ovmf_code="AAVMF/AAVMF_CODE.fd"
-                ovmf_vars="AAVMF/AAVMF_VARS.fd"
-            ;;
-            "arm"*)
-                ovmf_code="AAVMF/AAVMF32_CODE.fd"
-                ovmf_vars="AAVMF/AAVMF32_VARS.fd"
-            ;;
-            "loongarch64")
-                ovmf_code="qemu-efi-loongarch64/QEMU_EFI.fd"
-                ovmf_vars="qemu-efi-loongarch64/QEMU_VARS.fd"
-            ;;
-            "riscv64")
-                ovmf_code="qemu-efi-riscv64/RISCV_VIRT_CODE.fd"
-                ovmf_vars="qemu-efi-riscv64/RISCV_VIRT_VARS.fd"
-            ;;
-            *) 
-                ovmf_code="qemu-efi-$ovmflink_arch/QEMU_EFI.fd"
-                ovmf_vars="qemu-efi-$ovmflink_arch/QEMU_VARS.fd"
-        esac
-
-        create_link "../../$ovmf_code" "$ovmflink_dir/code.fd" || return $?
-        create_link "../../$ovmf_vars" "$ovmflink_dir/vars.fd" || return $?
-    }
-    installOVMF()
-    {
-        ovmf_pkg_arch="$1"
-        ovmf_temp_dir="$2"
-        ovmf_inst_dir="$3"
-        ovmf_link_dir="$4"
-
-        case "$ovmf_pkg_arch" in        
-            "i386"|\
-            "i686")   ovmf_pkg="ovmf-ia32"                ;;
-            "x86_64") ovmf_pkg="ovmf"                     ;;
-            "arm"*)   ovmf_pkg="qemu-efi-arm"             ;;
-            *)        ovmf_pkg="qemu-efi-$ovmf_pkg_arch"  ;;
-        esac
-
-        echo "Download deb for $ovmf_pkg:"
-        ovmf_work_dir="$ovmf_temp_dir/$ovmf_pkg"
-        mkdir -p "$ovmf_work_dir"
-        getOvmfPkg "$ovmf_pkg" "$ovmf_work_dir" || return $?
-
-        echo "Install $ovmf_pkg:"
-        ar vx "$ovmf_work_dir/$ovmf_pkg.deb" --output="$ovmf_work_dir"       || return $?
-        tar -xvf "$ovmf_work_dir/data.tar.xz" --directory="$ovmf_inst_dir/"  || return $?
-        rm -rf "$ovmf_work_dir" 
-        
-        echo "Create links:"  
-        mkdir -p "$ovmf_link_dir"
-        createOMVFLinks "$ovmf_pkg_arch" "$ovmf_link_dir" || return $?
-    }
-    createUefiShellLinks()
-    {
-        uefi_shell_link_arch="$1"
-        uefi_shell_link_dir="$2"
-        create_link "shell$uefi_shell_link_arch.efi" "$uefi_shell_link_dir/shell.efi" || return 1
-    }
-    installUefiShell()
-    {
-        uefi_shell_arch="$1"
-        uefi_shell_inst_dir="$2"
-        
-        uefi_shell_release="25H1"
-        uefi_shell_pkg="shell$uefi_shell_arch.efi"
-
-        uefi_shell_source="https://github.com/pbatard/UEFI-Shell/releases/download/$uefi_shell_release"
-        uefi_shell_url="$uefi_shell_source/$uefi_shell_pkg"
-
-        echo "Download UEFI-Shell ($uefi_shell_pkg):"
-        download_pkg "$uefi_shell_inst_dir/$uefi_shell_pkg" "$uefi_shell_url" || return $?
-
-        echo "Create links:"  
-        createUefiShellLinks "$uefi_shell_arch" "$uefi_shell_inst_dir" || return $?
-    }
-
-    ## vars
-
-    tools_arch="$1"
-    tools_inst_dir="$2"
-    tools_temp_dir="$3"
-    tools_force="$4"
-    shift 4
-    tools_targets="$*"
-
-    tools_uefi_arch=$(run_on_uefi_arch)
-    tools_link_dir="$tools_inst_dir/usr/share/edk2/$tools_uefi_arch"
-
-    ## Install tools
-
-    for t in $tools_targets; do
-        case "$t" in
-        "edk2")     echo "Installing EDK2 Firmware"
-                    if ! createOMVFLinks "$tools_arch" "$tools_link_dir" || [ -n "$tools_force" ] ; then
-                        installOVMF "$tools_arch" "$tools_temp_dir" "$tools_inst_dir" "$tools_link_dir" || return $?
-                    fi
-        ;;
-        "shell")    echo "Installing UEFI-Shell"
-                    if ! createUefiShellLinks "$tools_uefi_arch" "$tools_link_dir" || [ -n "$tools_force" ]; then
-                        installUefiShell "$tools_uefi_arch" "$tools_link_dir" || return $?
-                    fi
-        ;;
-        *)  echo "unsupported target '$t'" >&2
-            exit 1
-        ;;
-        esac
-    done
-}
-###
-
-###
-#
 #   install - install dependencies
-
+#
 #   CONF-VARS:
 #
 #   ARCH        architecture of qemu-system-* (e.g. x86_64, i386, aarch64), default: host architecture
+#   UEFI_ARCH   architecture of firmware and and artifact (e.g. x64, ia32, aa64), default: host architecture
 #
 #   INSTALLER   package manager, default: test availablity this order: apt, dnf, pacman, apk, emerge
-#   INST_DIR    install path, default: /
 #   TEMP_DIR    temp dir, default: /tmp
-#   EDK2_FORCE  force manual install, even if packages exist, default: false
-#   EDK2_FAIL   fail if package manager installation is not possible, default: false
-#   NO_SHELL    skip installing uefi-shell, default: false
 #   NOCONFIRM   don't ask for user consent, default: false
+#   EDK2VER     EDK2 Firmware release
 #
 ###
 run_on_uefi_install()
@@ -564,7 +406,6 @@ run_on_uefi_install()
     check_pkg() 
     {
         pkg_inst="$1"; pkg_label="$2"; pkg_name="$3";
-        echo "$pkg_inst: $?"
         case "$pkg_inst" in
             "apt")      apt-cache show "$pkg_name" > /dev/null 2>&1 ;;
             "dnf")      dnf info -q    "$pkg_name" > /dev/null 2>&1 ;;
@@ -574,10 +415,9 @@ run_on_uefi_install()
                 return 1
             ;;
         esac && pkg_res="found" || pkg_res="not found"
-        echo " - $pkg_label : $pkg_name ($pkg_res)"
+        echo " - $pkg_label : $pkg_res ($pkg_name)"
         [ "$pkg_res" = "found" ]
     }
-
     user_consent()
     {
         printf "Continue? (y/n) "
@@ -592,21 +432,41 @@ run_on_uefi_install()
             ;;
         esac
     }
+    install_deb()
+    {
+        deb_pkg="$1"
+        deb_pkg_dir="${TEMP_DIR:-/tmp}"
+
+        deb_pkg_base_url="http://ftp.debian.org/debian/pool/main/e/edk2"
+        deb_pkg_url="$deb_pkg_base_url/$deb_pkg"
+        deb_pkg_path="$deb_pkg_dir/$deb_pkg"
+        
+        echo "Install deb:"
+        echo "- pkg    : $deb_pkg"
+        echo "- pkg-url: $deb_pkg_url"
+        echo "- file   : $deb_pkg_path"
     
+        if ! wget -qO "$deb_pkg_path" "$deb_pkg_url"; then
+        echo "download failed $?" >&2
+        return 1;
+        fi
+        
+        dpkg -i "$deb_pkg_path" || return $?
+        rm -rf "$deb_pkg_path"
+    }
+
     ## vars
 
     arch="${ARCH:-"$(uname -m)"}"
+    uefi_arch=$(run_on_uefi_arch)
+    uefi_arch="${UEFI_ARCH:-"$uefi_arch"}"
     installer="${INSTALLER:-}"
-    inst_dir="${INST_DIR:-/}"
-    temp_dir="${TEMP_DIR:-/tmp}"
-    edk2_force="${EDK2_FORCE:-false}"
-    edk2_fail="${EDK2_FAIL:-false}"
-    no_shell="${NO_SHELL:-false}"
+    edk2ver="${EDK2VER:-"2025.02-8"}"
     noconfirm="${NOCONFIRM:-false}"
 
-    ## package manager
+    ## identify package manager
 
-    echo "Install Run on Uefi dependencies"
+    echo "Install run-on-uefi dependencies"
 
     if [ -z "$installer" ]; then
         for cmd in apt dnf pacman apk emerge; do
@@ -632,7 +492,16 @@ run_on_uefi_install()
 
     echo " - installer   : $installer"
 
-    ## packages
+    ## find packages
+
+    echo "Update Packages:"
+    case "$installer" in
+        "apt")      apt update -y ;;
+        "dnf")      dnf -y update ;;
+        "pacman")   pacman -Sy    ;;
+        "apk")      apk update    ;;
+        *)          return 1      ;;
+    esac || return 1
 
     # qemu
     case "$installer" in
@@ -646,63 +515,43 @@ run_on_uefi_install()
         ;;
     esac
 
-    # edk2
-    case "$arch" in
-        "x86_64") ekd2package="edk2-ovmf"      ;;
+    # uefi firmware
+    case "$arch" in        
         "i386"|\
-        "i686")   ekd2package="edk2-ovmf-ia32" ;;
-        "arm")    ekd2package="edk2-arm"       ;;
-        *)        ekd2package="edk2-$arch"     ;;
+        "i686")   pkg_efifw="ovmf-ia32"                ;;
+        "x86_64") pkg_efifw="ovmf"                     ;;
+        "arm"*)   pkg_efifw="qemu-efi-arm"             ;;
+        *)        pkg_efifw="qemu-efi-$arch"  ;;
     esac
 
-    echo "Update Packages:"
-    case "$installer" in
-        "apt")      apt update -y ;;
-        "dnf")      dnf -y update ;;
-        "pacman")   pacman -Sy    ;;
-        "apk")      apk update    ;;
-        *)          return 1      ;;
-    esac || return 1
+    # uefi shell
+    pkg_shell="efi-shell-$uefi_arch"
 
     echo "Check Packages:"
-    packages=""; edk2_failed=false
+    packages=""; pkg_fallback=""; pkg_deb="_${edk2ver}_all.deb"
     check_pkg "$installer" "qemu       " "$qemu_system" && packages="$packages $qemu_system" || return 1;
-    check_pkg "$installer" "firmware   " "$ekd2package" && packages="$packages $ekd2package" || edk2_failed=true;
-    $edk2_failed && $edk2_fail && return 1;
+    check_pkg "$installer" "firmware   " "$pkg_efifw"   && packages="$packages $pkg_efifw"   || pkg_fallback="$pkg_fallback $pkg_efifw$pkg_deb";
+    check_pkg "$installer" "uefi-shell " "$pkg_shell"   && packages="$packages $pkg_shell"   || pkg_fallback="$pkg_fallback $pkg_shell$pkg_deb";
+    [ -n "$pkg_fallback" ] && {
+    check_pkg "$installer" "dpkg       " "dpkg"         && packages="$packages wget dpkg"    || return 1; }
 
     ## Install Packages
 
     echo "Installing packages:"
     pkg_install_cmd="$install_cmd$packages"
-    echo " - command     : $pkg_install_cmd"
+    echo " - installer : $pkg_install_cmd"
+    [ -n "$pkg_fallback" ] && {
+    echo " - fallback  :$pkg_fallback"
+    }
+
     $noconfirm || user_consent || return 1
     eval "$pkg_install_cmd" || return 1
-
-    if  ( ! $edk2_failed ) && ( ! $edk2_force ) && $no_shell; then
-        return 0;
-    fi
-
-    ## EDK2 Fallback
-
-    echo "Installing tools:"
-    
-    # depdencies
-    tools=""; packages=" wget tar xz binutils"
-    ( $edk2_failed || $edk2_force ) && tools="$tools edk2"
-    ( ! $no_shell )                 && tools="$tools shell"
-
-    echo " - packages    : wget tar xz binutils"
-    echo " - tools       :$tools"
-
-    # install
-    pkg_install_cmd="$install_cmd$packages"
-    $noconfirm || user_consent || return 1
-    eval "$pkg_install_cmd" || return 1
-    run_on_uefi_install_edk2 "$arch" "$inst_dir" "$temp_dir" "$edk2_force" "$tools" || return 1
-
+    for p in $pkg_fallback; do
+        install_deb "$p" || return 1
+    done
     echo "done!" 
 }
-
+###
 
 ###
 #

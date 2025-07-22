@@ -4,7 +4,8 @@ TARGET 		?= example
 TARGET_CMD	?= "Hello, world!"
 SOURCE 		?= $(TARGET).c
 RUN_ON_UEFI	?= ../run_on_uefi
-UEFI_ARCH 	?= $(shell $(RUN_ON_UEFI) arch)
+ARCH		?= $(shell 	uname -m)
+UEFI_ARCH 	?= $(shell ARCH="$(ARCH)" $(RUN_ON_UEFI) arch)
 ARCH 		:= $(shell [ "$(UEFI_ARCH)" = "arm" ]   && echo "arm"   || echo "$(ARCH)" )
 ARCH 		:= $(shell [ "$(UEFI_ARCH)" = "ia32" ]  && echo "i386"  || echo "$(ARCH)" )
 LIBS_ARCH	?= $(shell [ "$(UEFI_ARCH)" = "ia32" ]  && echo "ia32"  || echo "$(ARCH)" )
@@ -20,7 +21,8 @@ OBJCOPY		?= objcopy
 
 # https://wiki.osdev.org/UEFI
 $(OUT_FILES).efi: $(SOURCE)
-	mkdir -p $(OUT_PATH)
+	@echo "make $@:"
+	@mkdir -p $(OUT_PATH)
 	
 	$(CC) $(SOURCE)                    \
 	    -c                             \
